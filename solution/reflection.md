@@ -12,4 +12,3 @@ If we had another pass and the budget pressure was even more intense (or if the 
 1. **Sampling Checks for Highly Stable Pipelines**: If certain checks (e.g., `contract_checkpoint` or `lineage_run`) are highly stable, we could query their tools every 2nd or 3rd run.
 2. **Cascading Checks**: We could monitor running stats or events to build a light dependency model, checking downstream views only if upstream sources showed high variance (though in the current random distribution, this would be risky).
 3. Under the current scoring formula where catching a single fault is worth 5-15x the cost of a query tool, the mathematically optimal choice is indeed to check every single event.
-
