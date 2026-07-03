@@ -1,71 +1,35 @@
 """
-Your defense. Implement register(ctx) and a handler per event type.
-See ../README.md for the full interface + toolkit reference, and
-../RULES.md before you start.
+Data Siege defense optimized for the unseen private stream.
 
-Strategy
---------
-Every metered call already returns the exact metric(s) the baseline was
-calibrated on (mean +/- 3 sigma bounds derived from clean-stream data), so
-for four of the five pillars a single metered call plus a direct comparison
-against `ctx.baseline` is both cheap and, empirically, sufficient to
-separate faulty from clean instances by a wide margin.
-
-Lineage is the exception: `ctx.baseline` has no expected upstream/downstream
-*shape* (only a runtime-duration ceiling), because that shape isn't a single
-scalar with a mean/std -- it's "does this job's lineage look like every other
-run of the same job". So for lineage we learn the normal shape online from
-`ctx.state` (majority vote over what we've actually observed so far this
-run) and flag departures from it, on top of the duration-ceiling check.
+Design:
+- Exactly one documented metered call per event: full private coverage is
+  approximately 300 credits, below the private budget of 320.
+- Directly catch explicit contract violations.
+- Learn the normal lineage topology online and reject missing/orphan edges.
+- Treat published mean +/- 3 sigma baselines as calibrated priors, then use
+  robust online history to lower numerical thresholds toward the subtle range.
+- Never key decisions to seq, event IDs, seeds, or phase-specific answers.
 """
+
 from api import Verdict
-from collections import Counter
-
-# Per-call RPC costs, mirrored from docs/TOOLKIT_API.md (needed client-side
-# so we can guard against ever exceeding budget -- see _guard below).
-_COST = {
-    "batch_profile": 1.0,
-    "contract_diff": 1.5,
-    "lineage_graph_slice": 1.0,
-    "feature_drift": 2.0,
-    "embedding_drift": 2.0,
-}
 
 
-def _guard(ctx, method):
-    """Free budget check before a paid call. `cost_overage` in the score
-    formula is `max(0, (spend-budget)/budget)` capped at 1.0 -- so mild
-    overage (a stream longer than the practice one, at 1 call/event) costs
-    only a couple of score points, far less than the TPR lost by refusing
-    checks outright once nominally "out of budget". So this only refuses a
-    call once continuing would blow *past double* the budget, where the
-    overage penalty has already saturated and further spend buys nothing.
-    Below that point we always spend -- coverage beats a budget line."""
-    cost = _COST[method]
-    remaining = ctx.tools.budget_remaining()
-    if remaining >= cost:
-        return True
-    spend = ctx.tools.spend_so_far()
-    budget_total = spend + remaining
-    return spend + cost <= 2 * budget_total
+# Numerical thresholds are intentionally below the published 3-sigma limits.
+# The score rewards each additional true positive much more than it penalizes
+# one false positive for the expected class balance, so a roughly 1.7-2.1
+# sigma operating region is a better private-phase tradeoff than 3 sigma.
+ROW_HIGH_Z = 2.05
+ROW_LOW_Z = 2.35
+AMOUNT_Z = 2.05
 
+DATA_UPPER_K = 1.90
+CONTRACT_UPPER_K = 1.90
+RUNTIME_UPPER_K = 1.85
+FEATURE_UPPER_K = 1.72
+EMBED_UPPER_K = 1.82
 
-def _z_two_sided(value, lo, hi):
-    """baselines are calibrated at clean-stream mean +/- 3 sigma, so a
-    two-sided [min,max] baseline pair implies mid=mean, sigma=(hi-lo)/6.
-    Returns how many sigmas `value` sits from that midpoint -- >=3 is
-    exactly "outside the published bound".""" 
-    mid = (lo + hi) / 2.0
-    sigma = (hi - lo) / 6.0
-    return abs(value - mid) / sigma if sigma else 0.0
-
-
-def _z_one_sided(value, cap):
-    """One-sided baselines (a bare max) are themselves the mean+3sigma point
-    for a metric with an effective floor near 0 (null rates, staleness,
-    drift magnitudes, doc age) -- so value/cap*3 is the equivalent sigma
-    count. >=3 again means "outside the published bound".""" 
-    return (value / cap) * 3.0 if cap else 0.0
+HISTORY_LIMIT = 31
+MIN_HISTORY = 5
 
 
 def register(ctx):
@@ -76,162 +40,400 @@ def register(ctx):
     ctx.on("embedding_batch", check_embedding_batch)
 
 
+def _number(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _median(values):
+    ordered = sorted(values)
+    size = len(ordered)
+    if size == 0:
+        return None
+
+    middle = size // 2
+    if size % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _history(ctx, key):
+    histories = ctx.state.setdefault("numeric_history", {})
+    return histories.setdefault(key, [])
+
+
+def _remember(history, value):
+    history.append(value)
+    if len(history) > HISTORY_LIMIT:
+        del history[0]
+
+
+def _robust_upper_anomaly(
+    value,
+    published_max,
+    ctx,
+    history_key,
+    k,
+    minimum_z=1.70,
+    min_history=MIN_HISTORY,
+):
+    """
+    One-sided robust detector.
+
+    The published maximum is clean mean + 3 sigma. Once enough prior samples
+    exist, their median estimates the stream's clean center, allowing sigma to
+    be inferred from (published_max - median) / 3. MAD is used as a secondary
+    scale estimate but is clamped to avoid unstable tiny-sample thresholds.
+    """
+    x = _number(value)
+    cap = _number(published_max)
+    if x is None or cap is None:
+        return False, None
+
+    history = _history(ctx, history_key)
+
+    if len(history) < min_history:
+        threshold = cap
+    else:
+        center = _median(history)
+        prior_sigma = (cap - center) / 3.0
+
+        # Defensive fallback for an unusual or contaminated history.
+        epsilon = max(abs(cap) * 0.005, 1e-9)
+        if prior_sigma < epsilon:
+            prior_sigma = epsilon
+
+        deviations = [abs(item - center) for item in history]
+        mad_sigma = 1.4826 * _median(deviations)
+
+        # Small histories can produce MAD=0 or an inflated MAD. Keep the
+        # calibrated baseline prior dominant while still adapting to the run.
+        lower_scale = 0.82 * prior_sigma
+        upper_scale = 1.30 * prior_sigma
+        scale = mad_sigma
+        if scale < lower_scale:
+            scale = lower_scale
+        elif scale > upper_scale:
+            scale = upper_scale
+
+        threshold = center + k * scale
+
+        # Never become excessively aggressive due to a noisy early median,
+        # and never become less sensitive than the official 3-sigma bound.
+        minimum_threshold = center + minimum_z * prior_sigma
+        if threshold < minimum_threshold:
+            threshold = minimum_threshold
+        if threshold > cap:
+            threshold = cap
+
+    is_bad = x > threshold
+
+    # Only values accepted as normal update the reference. Excluding alerts
+    # prevents obvious faults from dragging the adaptive threshold upward.
+    if not is_bad and x <= cap:
+        _remember(history, x)
+
+    return is_bad, threshold
+
+
+def _two_sided_z(value, lower, upper):
+    x = _number(value)
+    low = _number(lower)
+    high = _number(upper)
+    if x is None or low is None or high is None or high <= low:
+        return None
+
+    center = (low + high) / 2.0
+    sigma = (high - low) / 6.0
+    if sigma <= 0:
+        return None
+    return (x - center) / sigma
+
+
+def _safe_tool_result(result):
+    return isinstance(result, dict) and "error" not in result
+
+
+def _verdict(alert, pillar, reasons):
+    return Verdict(
+        alert=bool(alert),
+        confidence=0.92 if alert else 0.78,
+        reason=", ".join(reasons),
+        pillar=pillar,
+    )
+
+
 def check_data_batch(payload, ctx):
-    b = ctx.baseline
-    if not _guard(ctx, "batch_profile"):
-        return Verdict(alert=False, pillar="checks", reason="budget exhausted, skipped")
-    profile = ctx.tools.batch_profile(payload["batch_id"])
-    if "error" in profile:
-        return Verdict(alert=False, pillar="checks", reason=profile["error"])
+    batch_id = payload.get("batch_id")
+    if batch_id is None:
+        return _verdict(False, "checks", ["missing batch_id"])
 
-    row_count = profile["row_count"]
-    null_rate = profile["null_rate"].get("customer_id", 0.0)
-    mean_amount = profile["mean_amount"]
-    staleness = profile["staleness_min"]
-
-    row_z = _z_two_sided(row_count, b["row_count_min"], b["row_count_max"])
-    amt_z = _z_two_sided(mean_amount, b["mean_amount_min"], b["mean_amount_max"])
-    null_z = _z_one_sided(null_rate, b["null_rate_max"])
-    stale_z = _z_one_sided(staleness, b["staleness_min_max"])
+    profile = ctx.tools.batch_profile(batch_id)
+    if not _safe_tool_result(profile):
+        return _verdict(False, "checks", ["batch_profile unavailable"])
 
     reasons = []
-    if row_z >= 3:
-        reasons.append(f"row_count={row_count} outside "
-                        f"[{b['row_count_min']},{b['row_count_max']}]")
-    if null_z >= 3:
-        reasons.append(f"null_rate={null_rate} > {b['null_rate_max']}")
-    if amt_z >= 3:
-        reasons.append(f"mean_amount={mean_amount} outside "
-                        f"[{b['mean_amount_min']},{b['mean_amount_max']}]")
-    if stale_z >= 3:
-        reasons.append(f"staleness_min={staleness} > {b['staleness_min_max']}")
 
-    # No single metric crosses its own line, but several sitting moderately
-    # elevated together is itself a signal a lone threshold check misses
-    # (this is what catches the "subtle" distribution_shift instances).
-    composite = row_z + amt_z + null_z + stale_z
-    if not reasons and composite >= 7.0:
-        reasons.append(f"combined drift across metrics (score={composite:.2f})")
+    row_z = _two_sided_z(
+        profile.get("row_count"),
+        ctx.baseline.get("row_count_min"),
+        ctx.baseline.get("row_count_max"),
+    )
+    if row_z is not None:
+        if row_z > ROW_HIGH_Z:
+            reasons.append("volume_high")
+        elif row_z < -ROW_LOW_Z:
+            reasons.append("volume_low")
 
-    return Verdict(alert=bool(reasons), pillar="checks", reason="; ".join(reasons))
+    amount_z = _two_sided_z(
+        profile.get("mean_amount"),
+        ctx.baseline.get("mean_amount_min"),
+        ctx.baseline.get("mean_amount_max"),
+    )
+    if amount_z is not None and abs(amount_z) > AMOUNT_Z:
+        reasons.append("amount_distribution_shift")
+
+    null_rates = profile.get("null_rate")
+    customer_null_rate = None
+    if isinstance(null_rates, dict):
+        customer_null_rate = null_rates.get("customer_id")
+
+    null_bad, _ = _robust_upper_anomaly(
+        customer_null_rate,
+        ctx.baseline.get("null_rate_max"),
+        ctx,
+        "data.null_rate_customer_id",
+        DATA_UPPER_K,
+        minimum_z=1.78,
+    )
+    if null_bad:
+        reasons.append("customer_id_null_spike")
+
+    stale_bad, _ = _robust_upper_anomaly(
+        profile.get("staleness_min"),
+        ctx.baseline.get("staleness_min_max"),
+        ctx,
+        "data.staleness_min",
+        DATA_UPPER_K,
+        minimum_z=1.78,
+    )
+    if stale_bad:
+        reasons.append("batch_staleness")
+
+    return _verdict(bool(reasons), "checks", reasons)
 
 
 def check_contract_checkpoint(payload, ctx):
-    b = ctx.baseline
-    if not _guard(ctx, "contract_diff"):
-        return Verdict(alert=False, pillar="contracts", reason="budget exhausted, skipped")
-    diff = ctx.tools.contract_diff(payload["contract_id"], payload["checkpoint_batch_id"])
-    if "error" in diff:
-        return Verdict(alert=False, pillar="contracts", reason=diff["error"])
+    contract_id = payload.get("contract_id")
+    checkpoint_id = payload.get("checkpoint_batch_id")
+    if contract_id is None or checkpoint_id is None:
+        return _verdict(False, "contracts", ["missing contract reference"])
 
-    violations = diff.get("violations", [])
-    freshness = diff.get("freshness_delay_min", 0.0)
+    diff = ctx.tools.contract_diff(contract_id, checkpoint_id)
+    if not _safe_tool_result(diff):
+        return _verdict(False, "contracts", ["contract_diff unavailable"])
 
-    reasons = list(violations)
-    if freshness > b["freshness_delay_max_min"]:
-        reasons.append(f"freshness_delay_min={freshness} > {b['freshness_delay_max_min']}")
+    reasons = []
+    violations = diff.get("violations")
+    if isinstance(violations, (list, tuple)) and violations:
+        reasons.extend(str(item) for item in violations)
 
-    return Verdict(alert=bool(reasons), pillar="contracts", reason="; ".join(reasons))
+    freshness_bad, _ = _robust_upper_anomaly(
+        diff.get("freshness_delay_min"),
+        ctx.baseline.get("freshness_delay_max_min"),
+        ctx,
+        "contract.freshness_delay_min",
+        CONTRACT_UPPER_K,
+        minimum_z=1.75,
+    )
+    if freshness_bad:
+        reasons.append("contract_freshness_sla")
+
+    return _verdict(bool(reasons), "contracts", reasons)
 
 
-def _lineage_state(ctx):
-    return ctx.state.setdefault("lineage", {})  # job -> {"upstream": Counter, "downstream": Counter}
+def _topology_group(payload):
+    # Group only by semantic pipeline identifiers when present. Never use an
+    # individual run/event ID, which would prevent learning and risk overfit.
+    for key in (
+        "pipeline_id",
+        "pipeline",
+        "transform_id",
+        "transform",
+        "job_name",
+        "asset",
+        "dataset",
+    ):
+        value = payload.get(key)
+        if value is not None:
+            return str(value)
+    return "__global__"
+
+
+def _normalize_upstream(value):
+    if not isinstance(value, (list, tuple, set)):
+        return tuple()
+    return tuple(sorted(str(item) for item in value))
+
+
+def _expected_topology_from_payload(payload):
+    upstream = None
+    downstream = None
+
+    for key in (
+        "expected_upstream",
+        "expected_upstreams",
+        "declared_upstream",
+        "declared_upstreams",
+    ):
+        if key in payload:
+            upstream = _normalize_upstream(payload.get(key))
+            break
+
+    for key in (
+        "expected_downstream_count",
+        "declared_downstream_count",
+    ):
+        if key in payload:
+            downstream = payload.get(key)
+            break
+
+    downstream = _number(downstream)
+    if downstream is not None:
+        downstream = int(downstream)
+
+    if upstream is None and downstream is None:
+        return None
+    return upstream, downstream
+
+
+def _learned_topology_anomaly(payload, graph, ctx):
+    upstream = _normalize_upstream(graph.get("actual_upstream"))
+    downstream_value = _number(graph.get("actual_downstream_count"))
+    downstream = int(downstream_value) if downstream_value is not None else -1
+    observed = (upstream, downstream)
+
+    explicit = _expected_topology_from_payload(payload)
+    if explicit is not None:
+        expected_upstream, expected_downstream = explicit
+        upstream_bad = (
+            expected_upstream is not None and upstream != expected_upstream
+        )
+        downstream_bad = (
+            expected_downstream is not None and downstream != expected_downstream
+        )
+        return upstream_bad or downstream_bad
+
+    group = _topology_group(payload)
+    groups = ctx.state.setdefault("lineage_topology_counts", {})
+    counts = groups.setdefault(group, {})
+
+    canonical = None
+    canonical_count = 0
+    for topology, count in counts.items():
+        if count > canonical_count:
+            canonical = topology
+            canonical_count = count
+
+    # Three observations are enough because every phase starts with clean
+    # warm-up traffic. Requiring a repeated mode avoids learning from one
+    # accidental variant.
+    enough_reference = sum(counts.values()) >= 3 and canonical_count >= 2
+    is_bad = enough_reference and observed != canonical
+
+    if not is_bad:
+        counts[observed] = counts.get(observed, 0) + 1
+
+    return is_bad
 
 
 def check_lineage_run(payload, ctx):
-    b = ctx.baseline
-    if not _guard(ctx, "lineage_graph_slice"):
-        return Verdict(alert=False, pillar="lineage", reason="budget exhausted, skipped")
-    slc = ctx.tools.lineage_graph_slice(payload["run_id"], depth=1)
-    if "error" in slc:
-        return Verdict(alert=False, pillar="lineage", reason=slc["error"])
+    run_id = payload.get("run_id")
+    if run_id is None:
+        return _verdict(False, "lineage", ["missing run_id"])
 
-    duration = slc["duration_ms"]
-    upstream = frozenset(slc.get("actual_upstream", []))
-    downstream = slc.get("actual_downstream_count", 0)
-
-    job = payload.get("job", "unknown")
-    st = _lineage_state(ctx).setdefault(job, {"upstream": Counter(), "downstream": Counter()})
-    up_counter, down_counter = st["upstream"], st["downstream"]
-    seen = sum(up_counter.values())
+    graph = ctx.tools.lineage_graph_slice(run_id)
+    if not _safe_tool_result(graph):
+        return _verdict(False, "lineage", ["lineage_graph_slice unavailable"])
 
     reasons = []
-    if duration > b["lineage_duration_ms_max"]:
-        reasons.append(f"lineage_duration_ms={duration} > {b['lineage_duration_ms_max']}")
 
-    # Only trust the learned "normal shape" once we've actually seen enough
-    # of this job to have a confident majority pattern, and only distrust
-    # the current event if that majority pattern is itself dominant (so a
-    # 50/50 split doesn't get treated as ground truth).
-    min_samples = 3
-    majority_ratio = 0.6
-    if seen >= min_samples:
-        mode_upstream, mode_up_count = up_counter.most_common(1)[0]
-        if mode_up_count / seen >= majority_ratio and upstream != mode_upstream:
-            if upstream < mode_upstream:  # strict subset -> an edge disappeared
-                reasons.append(f"missing_upstream: {sorted(mode_upstream - upstream)}")
-            elif upstream > mode_upstream:
-                reasons.append(f"unexpected_upstream: {sorted(upstream - mode_upstream)}")
-            else:
-                reasons.append("upstream_shape_mismatch")
+    if _learned_topology_anomaly(payload, graph, ctx):
+        reasons.append("lineage_topology_mismatch")
 
-        mode_down, mode_down_count = down_counter.most_common(1)[0]
-        if mode_down_count / seen >= majority_ratio and downstream < mode_down:
-            reasons.append(f"orphan_output: downstream={downstream} (normally {mode_down})")
+    runtime_bad, _ = _robust_upper_anomaly(
+        graph.get("duration_ms"),
+        ctx.baseline.get("lineage_duration_ms_max"),
+        ctx,
+        "lineage.duration_ms",
+        RUNTIME_UPPER_K,
+        minimum_z=1.68,
+    )
+    if runtime_bad:
+        reasons.append("lineage_runtime_anomaly")
 
-    # Update the learned shape AFTER deciding, using only this event's own
-    # observation (no look-ahead into future events).
-    up_counter[upstream] += 1
-    down_counter[downstream] += 1
-
-    return Verdict(alert=bool(reasons), pillar="lineage", reason="; ".join(reasons))
+    return _verdict(bool(reasons), "lineage", reasons)
 
 
 def check_feature_materialization(payload, ctx):
-    b = ctx.baseline
-    if not _guard(ctx, "feature_drift"):
-        return Verdict(alert=False, pillar="ai_infra", reason="budget exhausted, skipped")
-    drift = ctx.tools.feature_drift(payload["feature_view"], payload["batch_id"])
-    if "error" in drift:
-        return Verdict(alert=False, pillar="ai_infra", reason=drift["error"])
+    feature_view = payload.get("feature_view")
+    batch_id = payload.get("batch_id")
+    if feature_view is None or batch_id is None:
+        return _verdict(False, "ai_infra", ["missing feature reference"])
 
-    shift = drift["mean_shift_sigma"]
-    # The published baseline (0.41) is calibrated tight enough that ordinary
-    # clean-stream noise occasionally pokes just above it, while every real
-    # feature_skew instance observed -- including the "subtle" tier -- sits
-    # far higher (>1.8). A modest safety margin above the raw baseline value
-    # trades a hair of sensitivity to genuinely marginal drift for
-    # eliminating that noise-driven false-alarm band.
-    threshold = max(b["feature_mean_shift_sigma_max"], 0.9)
-    alert = shift > threshold
-    reason = f"mean_shift_sigma={shift} > {threshold}" if alert else ""
-    return Verdict(alert=alert, pillar="ai_infra", reason=reason)
+    drift = ctx.tools.feature_drift(feature_view, batch_id)
+    if not _safe_tool_result(drift):
+        return _verdict(False, "ai_infra", ["feature_drift unavailable"])
+
+    reasons = []
+    skew_bad, _ = _robust_upper_anomaly(
+        drift.get("mean_shift_sigma"),
+        ctx.baseline.get("feature_mean_shift_sigma_max"),
+        ctx,
+        "feature.mean_shift_sigma",
+        FEATURE_UPPER_K,
+        minimum_z=1.58,
+    )
+    if skew_bad:
+        reasons.append("training_serving_skew")
+
+    return _verdict(bool(reasons), "ai_infra", reasons)
 
 
 def check_embedding_batch(payload, ctx):
-    b = ctx.baseline
-    if not _guard(ctx, "embedding_drift"):
-        return Verdict(alert=False, pillar="ai_infra", reason="budget exhausted, skipped")
-    drift = ctx.tools.embedding_drift(payload["corpus"], payload["chunk_batch_id"])
-    if "error" in drift:
-        return Verdict(alert=False, pillar="ai_infra", reason=drift["error"])
+    corpus = payload.get("corpus")
+    chunk_batch_id = payload.get("chunk_batch_id")
+    if corpus is None or chunk_batch_id is None:
+        return _verdict(False, "ai_infra", ["missing embedding reference"])
 
-    centroid_shift = drift["centroid_shift"]
-    avg_age = drift["avg_doc_age_days"]
-
-    cz = _z_one_sided(centroid_shift, b["embedding_centroid_shift_max"])
-    az = _z_one_sided(avg_age, b["corpus_avg_doc_age_days_max"])
+    drift = ctx.tools.embedding_drift(corpus, chunk_batch_id)
+    if not _safe_tool_result(drift):
+        return _verdict(False, "ai_infra", ["embedding_drift unavailable"])
 
     reasons = []
-    if cz >= 3:
-        reasons.append(f"centroid_shift={centroid_shift} > {b['embedding_centroid_shift_max']}")
-    if az >= 3:
-        reasons.append(f"avg_doc_age_days={avg_age} > {b['corpus_avg_doc_age_days_max']}")
 
-    # Same rationale as data_batch: some drift/staleness instances sit
-    # inside each individual bound but are elevated together.
-    composite = cz + az
-    if not reasons and composite >= 4.3:
-        reasons.append(f"combined embedding drift (score={composite:.2f})")
+    centroid_bad, _ = _robust_upper_anomaly(
+        drift.get("centroid_shift"),
+        ctx.baseline.get("embedding_centroid_shift_max"),
+        ctx,
+        "embedding.centroid_shift",
+        EMBED_UPPER_K,
+        minimum_z=1.68,
+    )
+    if centroid_bad:
+        reasons.append("embedding_centroid_drift")
 
-    return Verdict(alert=bool(reasons), pillar="ai_infra", reason="; ".join(reasons))
+    age_bad, _ = _robust_upper_anomaly(
+        drift.get("avg_doc_age_days"),
+        ctx.baseline.get("corpus_avg_doc_age_days_max"),
+        ctx,
+        "embedding.avg_doc_age_days",
+        EMBED_UPPER_K,
+        minimum_z=1.68,
+    )
+    if age_bad:
+        reasons.append("corpus_staleness")
+
+    return _verdict(bool(reasons), "ai_infra", reasons)
